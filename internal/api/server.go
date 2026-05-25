@@ -151,11 +151,15 @@ func (s *Server) handleActionReload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	if err := s.svc.Reload(r.Context()); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+	output, err := s.svc.ReloadWithOutput(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":  err.Error(),
+			"output": output,
+		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "output": output})
 }
 
 func (s *Server) handleActionRestart(w http.ResponseWriter, r *http.Request) {
@@ -342,7 +346,10 @@ func (s *Server) handleEnsureStructure(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Content string `json:"content"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
 	if err := s.svc.EnsureJailLocalStructureWithContent(req.Content); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return

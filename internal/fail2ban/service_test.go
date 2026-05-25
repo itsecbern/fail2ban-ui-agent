@@ -17,6 +17,7 @@
 package fail2ban
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -145,5 +146,71 @@ action = %(action_mwlg)s
 	}
 	if !strings.Contains(got, "enabled = true") {
 		t.Fatalf("expected defaults content in jail.local: %s", got)
+	}
+}
+
+func TestDeleteFilterRemovesLocalAndConf(t *testing.T) {
+	root := t.TempDir()
+	filterDir := filepath.Join(root, "filter.d")
+	if err := os.MkdirAll(filterDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	localPath := filepath.Join(filterDir, "apache.local")
+	confPath := filepath.Join(filterDir, "apache.conf")
+	if err := os.WriteFile(localPath, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(confPath, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewService(root, "/var/run/fail2ban", "/var/log")
+	if err := s.DeleteFilter("apache"); err != nil {
+		t.Fatalf("DeleteFilter failed: %v", err)
+	}
+	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed", localPath)
+	}
+	if _, err := os.Stat(confPath); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed", confPath)
+	}
+}
+
+func TestDeleteFilterReturnsNotFound(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "filter.d"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewService(root, "/var/run/fail2ban", "/var/log")
+	err := s.DeleteFilter("missing")
+	if err == nil {
+		t.Fatal("expected not found error")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReloadWithOutputReturnsCommandOutput(t *testing.T) {
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(binDir, "fail2ban-client")
+	script := "#!/usr/bin/env sh\nif [ \"$1\" = \"reload\" ]; then\n  echo \"reload-ok\"\n  exit 0\nfi\nexit 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	s := NewService(root, "/var/run/fail2ban", "/var/log")
+	out, err := s.ReloadWithOutput(context.Background())
+	if err != nil {
+		t.Fatalf("ReloadWithOutput failed: %v", err)
+	}
+	if !strings.Contains(out, "reload-ok") {
+		t.Fatalf("expected reload output, got: %q", out)
 	}
 }

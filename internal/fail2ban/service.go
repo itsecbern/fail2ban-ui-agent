@@ -153,8 +153,12 @@ func (s *Service) UnbanIP(ctx context.Context, jail, ip string) error {
 }
 
 func (s *Service) Reload(ctx context.Context) error {
-	_, err := s.client(ctx, "reload")
+	_, err := s.ReloadWithOutput(ctx)
 	return err
+}
+
+func (s *Service) ReloadWithOutput(ctx context.Context) (string, error) {
+	return s.client(ctx, "reload")
 }
 
 func (s *Service) Restart(ctx context.Context) error {
@@ -174,7 +178,7 @@ func (s *Service) Restart(ctx context.Context) error {
 		}
 	}
 	// fallback if service manager is unavailable
-	if err := s.Reload(ctx); err != nil {
+	if _, err := s.ReloadWithOutput(ctx); err != nil {
 		if lastErr != nil {
 			return fmt.Errorf("%v; fallback reload failed: %w", lastErr, err)
 		}
@@ -491,9 +495,26 @@ func (s *Service) CreateFilter(name, content string) error {
 }
 
 func (s *Service) DeleteFilter(name string) error {
-	p := filepath.Join(s.configRoot, "filter.d", name+".local")
-	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("filter name cannot be empty")
+	}
+	fd := filepath.Join(s.configRoot, "filter.d")
+	localPath := filepath.Join(fd, name+".local")
+	confPath := filepath.Join(fd, name+".conf")
+	var deleted int
+	if err := os.Remove(localPath); err == nil {
+		deleted++
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
+	}
+	if err := os.Remove(confPath); err == nil {
+		deleted++
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if deleted == 0 {
+		return fmt.Errorf("filter file %s.local or %s.conf does not exist", name, name)
 	}
 	return nil
 }

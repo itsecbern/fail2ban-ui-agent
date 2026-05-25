@@ -148,3 +148,61 @@ func TestEnsureStructureEndpointUsesProvidedContent(t *testing.T) {
 		t.Fatalf("legacy action should be stripped: %s", got)
 	}
 }
+
+func TestEnsureStructureEndpointRejectsInvalidJSON(t *testing.T) {
+	cfgRoot := t.TempDir()
+	svc := fail2ban.NewService(cfgRoot, "/var/run/fail2ban", "/var/log")
+	hs := health.New(svc, time.Hour, false, false, 1)
+	s := New("secret", cfgRoot, svc, hs)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jails/ensure-structure", strings.NewReader("{invalid"))
+	req.Header.Set("X-F2B-Token", "secret")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "invalid JSON") {
+		t.Fatalf("unexpected body: %s", rr.Body.String())
+	}
+}
+
+func TestActionReloadReturnsOutput(t *testing.T) {
+	cfgRoot := t.TempDir()
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(binDir, "fail2ban-client")
+	script := "#!/usr/bin/env sh\nif [ \"$1\" = \"reload\" ]; then\n  echo \"reload-ok\"\n  exit 0\nfi\nexit 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+
+	svc := fail2ban.NewService(cfgRoot, "/var/run/fail2ban", "/var/log")
+	hs := health.New(svc, time.Hour, false, false, 1)
+	s := New("secret", cfgRoot, svc, hs)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/actions/reload", nil)
+	req.Header.Set("X-F2B-Token", "secret")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		OK     bool   `json:"ok"`
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("expected ok=true, got %+v", resp)
+	}
+	if !strings.Contains(resp.Output, "reload-ok") {
+		t.Fatalf("expected reload output in response, got: %q", resp.Output)
+	}
+}
