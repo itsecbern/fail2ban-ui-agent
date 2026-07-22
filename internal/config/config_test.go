@@ -45,17 +45,6 @@ func TestLoadMissingSecret(t *testing.T) {
 	}
 }
 
-func TestLoadAllowNoSecret(t *testing.T) {
-	_ = os.Unsetenv("AGENT_SECRET")
-	cfg, err := LoadAllowNoSecret()
-	if err != nil {
-		t.Fatalf("LoadAllowNoSecret error: %v", err)
-	}
-	if cfg.BindAddress == "" {
-		t.Fatal("expected defaults to be loaded")
-	}
-}
-
 func TestLoadHealthIntervalFloor(t *testing.T) {
 	t.Setenv("AGENT_SECRET", "x")
 	t.Setenv("AGENT_HEALTH_INTERVAL", "1s")

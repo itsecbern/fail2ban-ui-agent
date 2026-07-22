@@ -19,6 +19,7 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,7 +32,10 @@ import (
 	"github.com/swissmakers/fail2ban-ui-agent/internal/config"
 	"github.com/swissmakers/fail2ban-ui-agent/internal/fail2ban"
 	"github.com/swissmakers/fail2ban-ui-agent/internal/health"
+	"github.com/swissmakers/fail2ban-ui-agent/internal/model"
 )
+
+const maxRequestBodyBytes = 5 << 20
 
 type Server struct {
 	secret     string
@@ -82,12 +86,23 @@ func (s *Server) ListenAndServe(ctx context.Context, addr, tlsCertFile, tlsKeyFi
 		Addr:              addr,
 		Handler:           s.mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// Match the UI-side connector, which also pins TLS 1.2 as the floor.
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	tlsEnabled := tlsCertFile != "" && tlsKeyFile != ""
+	if !tlsEnabled && !isLoopbackAddr(addr) {
+		// The agent bearer token and the pushed callback secret would travel in
+		// cleartext. Warn loudly so this is never done unknowingly in production.
+		log.Printf("WARNING: agent is binding a non-loopback address (%s) WITHOUT TLS - the agent token and callback secret will be transmitted in cleartext. Set AGENT_TLS_CERT_FILE/AGENT_TLS_KEY_FILE, or bind to localhost behind a TLS-terminating proxy.", addr)
 	}
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("fail2ban-ui-agent listening on %s", addr)
 		var err error
-		if tlsCertFile != "" && tlsKeyFile != "" {
+		if tlsEnabled {
 			log.Printf("TLS enabled for agent API")
 			err = server.ListenAndServeTLS(tlsCertFile, tlsKeyFile)
 		} else {
@@ -111,13 +126,43 @@ func (s *Server) ListenAndServe(ctx context.Context, addr, tlsCertFile, tlsKeyFi
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := r.Header.Get("X-F2B-Token")
-		if subtle.ConstantTimeCompare([]byte(token), []byte(s.secret)) != 1 {
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		if s.secret == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "server misconfigured: no agent secret set",
+				"code":  "auth_not_configured",
+			})
 			return
 		}
+		token := r.Header.Get("X-F2B-Token")
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.secret)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"error": "unauthorized",
+				"code":  "auth_invalid_token",
+			})
+			return
+		}
+		// Bound the request body for every authenticated (body-carrying) route.
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		next(w, r)
 	}
+}
+
+// Reports whether the request carries the valid agent token.
+func (s *Server) requestAuthorized(r *http.Request) bool {
+	if s.secret == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get("X-F2B-Token")), []byte(s.secret)) == 1
+}
+
+func (s *Server) healthPayload(r *http.Request) model.HealthState {
+	state := s.health.State()
+	if s.requestAuthorized(r) {
+		return state
+	}
+	state.LastError = ""
+	state.LastRemediation = ""
+	return state
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +170,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	state := s.health.State()
+	state := s.healthPayload(r)
 	code := http.StatusOK
 	if !state.Healthy {
 		code = http.StatusServiceUnavailable
@@ -138,7 +183,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	state := s.health.State()
+	state := s.healthPayload(r)
 	if !state.Healthy {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false, "state": state})
 		return
@@ -407,7 +452,7 @@ func (s *Server) handleJailsSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if len(parts) == 2 && parts[1] == "ban" && r.Method == http.MethodPost {
+	if len(parts) == 2 && (parts[1] == "ban" || parts[1] == "unban") && r.Method == http.MethodPost {
 		var req struct {
 			IP string `json:"ip"`
 		}
@@ -415,30 +460,15 @@ func (s *Server) handleJailsSub(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
 			return
 		}
-		if ip := net.ParseIP(strings.TrimSpace(req.IP)); ip == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid IP"})
+		if err := fail2ban.ValidateIP(req.IP); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid IP: " + err.Error()})
 			return
 		}
-		if err := s.svc.BanIP(r.Context(), parts[0], req.IP); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
+		action := s.svc.BanIP
+		if parts[1] == "unban" {
+			action = s.svc.UnbanIP
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-		return
-	}
-	if len(parts) == 2 && parts[1] == "unban" && r.Method == http.MethodPost {
-		var req struct {
-			IP string `json:"ip"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
-			return
-		}
-		if ip := net.ParseIP(strings.TrimSpace(req.IP)); ip == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid IP"})
-			return
-		}
-		if err := s.svc.UnbanIP(r.Context(), parts[0], req.IP); err != nil {
+		if err := action(r.Context(), parts[0], req.IP); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
@@ -548,6 +578,25 @@ func (s *Server) handleFiltersTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"output": out, "filterPath": path})
+}
+
+// Reports whether a listen address binds only the loopback interface
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.TrimSpace(host)
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "*" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func splitPath(s string) []string {

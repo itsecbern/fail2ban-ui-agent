@@ -51,14 +51,6 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	return load(true)
-}
-
-func LoadAllowNoSecret() (Config, error) {
-	return load(false)
-}
-
-func load(requireSecret bool) (Config, error) {
 	cfg := Config{
 		BindAddress:       envOr("AGENT_BIND_ADDRESS", "0.0.0.0"),
 		Port:              envInt("AGENT_PORT", 9700),
@@ -79,7 +71,7 @@ func load(requireSecret bool) (Config, error) {
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return cfg, fmt.Errorf("invalid AGENT_PORT: %d", cfg.Port)
 	}
-	if requireSecret && cfg.Secret == "" {
+	if cfg.Secret == "" {
 		return cfg, fmt.Errorf("AGENT_SECRET is required")
 	}
 	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {

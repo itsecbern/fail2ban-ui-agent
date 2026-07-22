@@ -25,21 +25,6 @@ import (
 	"testing"
 )
 
-func TestSetEnabledValue(t *testing.T) {
-	got := setEnabledValue("[sshd]\nport = ssh\n", "sshd", false)
-	if !containsLine(got, "enabled = false") {
-		t.Fatalf("enabled not inserted: %q", got)
-	}
-	got2 := setEnabledValue("[sshd]\nenabled = false\n", "sshd", true)
-	if !containsLine(got2, "enabled = true") {
-		t.Fatalf("enabled not replaced: %q", got2)
-	}
-}
-
-func containsLine(s, line string) bool {
-	return strings.Contains(s, line)
-}
-
 func TestCleanupLegacyUICustomAction(t *testing.T) {
 	root := t.TempDir()
 	jailLocal := filepath.Join(root, "jail.local")

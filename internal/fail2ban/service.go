@@ -105,7 +105,10 @@ func (s *Service) GetJails(ctx context.Context) ([]string, error) {
 }
 
 func (s *Service) GetBannedIPs(ctx context.Context, jail string) ([]string, int, error) {
-	ips, count, err := s.getBannedInfo(ctx, jail)
+	if err := ValidateJailName(jail); err != nil {
+		return nil, 0, err
+	}
+	ips, count, err := s.getBannedInfo(ctx, strings.TrimSpace(jail))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -143,12 +146,24 @@ func (s *Service) getBannedInfo(ctx context.Context, jail string) ([]string, int
 }
 
 func (s *Service) BanIP(ctx context.Context, jail, ip string) error {
-	_, err := s.client(ctx, "set", jail, "banip", ip)
+	if err := ValidateJailName(jail); err != nil {
+		return err
+	}
+	if err := ValidateIP(ip); err != nil {
+		return err
+	}
+	_, err := s.client(ctx, "set", strings.TrimSpace(jail), "banip", strings.TrimSpace(ip))
 	return err
 }
 
 func (s *Service) UnbanIP(ctx context.Context, jail, ip string) error {
-	_, err := s.client(ctx, "set", jail, "unbanip", ip)
+	if err := ValidateJailName(jail); err != nil {
+		return err
+	}
+	if err := ValidateIP(ip); err != nil {
+		return err
+	}
+	_, err := s.client(ctx, "set", strings.TrimSpace(jail), "unbanip", strings.TrimSpace(ip))
 	return err
 }
 
@@ -200,6 +215,10 @@ func (s *Service) GetFilterConfig(name string) (string, string, error) {
 }
 
 func (s *Service) SetFilterConfig(name, content string) error {
+	if err := ValidateFilterName(name); err != nil {
+		return err
+	}
+	name = strings.TrimSpace(name)
 	p := filepath.Join(s.configRoot, "filter.d", name+".local")
 	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 		return err
@@ -235,22 +254,46 @@ func (s *Service) GetFilters() ([]string, error) {
 }
 
 func (s *Service) TestFilter(ctx context.Context, filterName string, logLines []string, filterContent string) (string, string, error) {
+	if err := ValidateFilterName(filterName); err != nil {
+		return "", "", err
+	}
+	filterName = strings.TrimSpace(filterName)
+
+	var filterPath string
+	if strings.TrimSpace(filterContent) != "" {
+		// Ad-hoc content: write to a private temp dir with a randomised file name
+		// (never derived from caller input) so it cannot collide or traverse.
+		tmpDir, err := os.MkdirTemp("", "f2b-agent-test-")
+		if err != nil {
+			return "", "", err
+		}
+		defer os.RemoveAll(tmpDir)
+		filterPath = filepath.Join(tmpDir, "filter.conf")
+		if err := os.WriteFile(filterPath, []byte(filterContent), 0600); err != nil {
+			return "", "", err
+		}
+		logPath := filepath.Join(tmpDir, "logs.log")
+		if err := os.WriteFile(logPath, []byte(strings.Join(logLines, "\n")), 0600); err != nil {
+			return "", "", err
+		}
+		cmd := exec.CommandContext(ctx, "fail2ban-regex", logPath, filterPath)
+		out, err := cmd.CombinedOutput()
+		return string(out), filterPath, err
+	}
+
 	filterPath, err := s.pickFilterPath(filterName)
 	if err != nil {
 		return "", "", err
 	}
-	if strings.TrimSpace(filterContent) != "" {
-		filterPath = filepath.Join(os.TempDir(), "f2b-agent-filter-"+filterName+".conf")
-		if err := os.WriteFile(filterPath, []byte(filterContent), 0600); err != nil {
-			return "", "", err
-		}
-		defer os.Remove(filterPath)
+	tmpDir, err := os.MkdirTemp("", "f2b-agent-test-")
+	if err != nil {
+		return "", "", err
 	}
-	logPath := filepath.Join(os.TempDir(), "f2b-agent-logs-"+filterName+".log")
+	defer os.RemoveAll(tmpDir)
+	logPath := filepath.Join(tmpDir, "logs.log")
 	if err := os.WriteFile(logPath, []byte(strings.Join(logLines, "\n")), 0600); err != nil {
 		return "", "", err
 	}
-	defer os.Remove(logPath)
 
 	cmd := exec.CommandContext(ctx, "fail2ban-regex", logPath, filterPath)
 	out, err := cmd.CombinedOutput()
@@ -258,18 +301,18 @@ func (s *Service) TestFilter(ctx context.Context, filterName string, logLines []
 }
 
 func (s *Service) GetJailConfig(jail string) (string, string, error) {
-	jail = strings.TrimSpace(jail)
-	if jail == "" {
-		return "", "", fmt.Errorf("jail name cannot be empty")
+	if err := ValidateJailName(jail); err != nil {
+		return "", "", err
 	}
+	jail = strings.TrimSpace(jail)
 	return readJailConfigWithFallback(jail, s.configRoot)
 }
 
 func (s *Service) SetJailConfig(jail, content string) error {
-	jail = strings.TrimSpace(jail)
-	if jail == "" {
-		return fmt.Errorf("jail name cannot be empty")
+	if err := ValidateJailName(jail); err != nil {
+		return err
 	}
+	jail = strings.TrimSpace(jail)
 	if err := ensureJailLocalFile(jail, s.configRoot); err != nil {
 		return err
 	}
@@ -282,10 +325,10 @@ func (s *Service) SetJailConfig(jail, content string) error {
 
 func (s *Service) UpdateJailEnabledStates(updates map[string]bool) error {
 	for jail, enabled := range updates {
-		jail = strings.TrimSpace(jail)
-		if jail == "" {
-			continue
+		if err := ValidateJailName(jail); err != nil {
+			return err
 		}
+		jail = strings.TrimSpace(jail)
 		if err := ensureJailLocalFile(jail, s.configRoot); err != nil {
 			return fmt.Errorf("jail %q: %w", jail, err)
 		}
@@ -397,10 +440,6 @@ func (s *Service) jailLocalState() (exists bool, managed bool, hasLegacyUICustom
 	return true, strings.Contains(content, "managed by fail2ban-ui-agent"), strings.Contains(content, "ui-custom-action"), nil
 }
 
-func (s *Service) EnsureJailLocalStructure() error {
-	return s.EnsureJailLocalStructureWithContent("")
-}
-
 func stripLegacyUICustomActionLines(content string) string {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	lines := strings.Split(content, "\n")
@@ -466,10 +505,10 @@ func (s *Service) CreateJail(name, content string) error {
 }
 
 func (s *Service) DeleteJail(name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("jail name cannot be empty")
+	if err := ValidateJailName(name); err != nil {
+		return err
 	}
+	name = strings.TrimSpace(name)
 	jd := jailDDir(s.configRoot)
 	localPath := filepath.Join(jd, name+".local")
 	confPath := filepath.Join(jd, name+".conf")
@@ -495,10 +534,10 @@ func (s *Service) CreateFilter(name, content string) error {
 }
 
 func (s *Service) DeleteFilter(name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return fmt.Errorf("filter name cannot be empty")
+	if err := ValidateFilterName(name); err != nil {
+		return err
 	}
+	name = strings.TrimSpace(name)
 	fd := filepath.Join(s.configRoot, "filter.d")
 	localPath := filepath.Join(fd, name+".local")
 	confPath := filepath.Join(fd, name+".conf")
@@ -531,6 +570,10 @@ func (s *Service) client(ctx context.Context, args ...string) (string, error) {
 }
 
 func (s *Service) pickFilterPath(name string) (string, error) {
+	if err := ValidateFilterName(name); err != nil {
+		return "", err
+	}
+	name = strings.TrimSpace(name)
 	local := filepath.Join(s.configRoot, "filter.d", name+".local")
 	if _, err := os.Stat(local); err == nil {
 		return local, nil
@@ -550,28 +593,4 @@ func parseIntAfterColon(line string) int {
 	v := strings.TrimSpace(line[idx+1:])
 	n, _ := strconv.Atoi(v)
 	return n
-}
-
-func setEnabledValue(content, jail string, enabled bool) string {
-	value := "false"
-	if enabled {
-		value = "true"
-	}
-	if strings.TrimSpace(content) == "" {
-		return fmt.Sprintf("[%s]\nenabled = %s\n", jail, value)
-	}
-	lines := strings.Split(content, "\n")
-	replaced := false
-	for i, line := range lines {
-		trim := strings.TrimSpace(strings.ToLower(line))
-		if strings.HasPrefix(trim, "enabled") && strings.Contains(trim, "=") {
-			lines[i] = "enabled = " + value
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		lines = append(lines, "enabled = "+value)
-	}
-	return strings.Join(lines, "\n")
 }

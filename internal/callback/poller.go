@@ -181,20 +181,14 @@ func diffSnapshots(prev, cur map[string]map[string]struct{}) (bans, unbans []edg
 }
 
 func (p *Poller) postBan(ctx context.Context, rt callbackRuntime, jail, ip string) error {
-	body := map[string]string{
-		"ip":   ip,
-		"jail": jail,
-	}
-	if rt.serverID != "" {
-		body["serverId"] = rt.serverID
-	}
-	if rt.hostname != "" {
-		body["hostname"] = rt.hostname
-	}
-	return p.postJSON(ctx, rt, "/api/ban", body)
+	return p.postEvent(ctx, rt, "/api/ban", jail, ip)
 }
 
 func (p *Poller) postUnban(ctx context.Context, rt callbackRuntime, jail, ip string) error {
+	return p.postEvent(ctx, rt, "/api/unban", jail, ip)
+}
+
+func (p *Poller) postEvent(ctx context.Context, rt callbackRuntime, endpoint, jail, ip string) error {
 	body := map[string]string{
 		"ip":   ip,
 		"jail": jail,
@@ -205,7 +199,7 @@ func (p *Poller) postUnban(ctx context.Context, rt callbackRuntime, jail, ip str
 	if rt.hostname != "" {
 		body["hostname"] = rt.hostname
 	}
-	return p.postJSON(ctx, rt, "/api/unban", body)
+	return p.postJSON(ctx, rt, endpoint, body)
 }
 
 func (p *Poller) postJSON(ctx context.Context, rt callbackRuntime, endpoint string, body map[string]string) error {
@@ -232,10 +226,7 @@ func (p *Poller) postJSON(ctx context.Context, rt callbackRuntime, endpoint stri
 }
 
 func shouldStartPoller(cfg config.Config) bool {
-	if cfg.CallbackPollInterval <= 0 {
-		return false
-	}
-	return true
+	return cfg.CallbackPollInterval > 0
 }
 
 // StartPoller runs NewPoller(...).Run in a goroutine if polling is enabled.

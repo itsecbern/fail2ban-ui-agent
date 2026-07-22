@@ -43,6 +43,85 @@ func TestAuthRequired(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d want %d", rr.Code, http.StatusUnauthorized)
 	}
+	var payload map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON body: %v", err)
+	}
+	if got, _ := payload["code"].(string); got != "auth_invalid_token" {
+		t.Fatalf("code=%q want %q", got, "auth_invalid_token")
+	}
+}
+
+func TestEmptySecretFailsClosed(t *testing.T) {
+	svc := fail2ban.NewService(t.TempDir(), "/var/run/fail2ban", "/var/log")
+	hs := health.New(svc, time.Hour, false, false, 1)
+	s := New("", t.TempDir(), svc, hs) // no secret configured
+
+	// An empty token must NOT authenticate when the secret is empty.
+	req := httptest.NewRequest(http.MethodPost, "/v1/actions/reload", nil)
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code == http.StatusOK {
+		t.Fatalf("empty secret authenticated a request (status=%d)", rr.Code)
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want %d", rr.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestRequestBodyIsBounded(t *testing.T) {
+	cfgRoot := t.TempDir()
+	svc := fail2ban.NewService(cfgRoot, "/var/run/fail2ban", "/var/log")
+	hs := health.New(svc, time.Hour, false, false, 1)
+	s := New("secret", cfgRoot, svc, hs)
+
+	// A body larger than maxRequestBodyBytes must be rejected, not written.
+	huge := `{"name":"okjail","content":"` + strings.Repeat("A", maxRequestBodyBytes+1024) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/jails", strings.NewReader(huge))
+	req.Header.Set("X-F2B-Token", "secret")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code == http.StatusCreated || rr.Code == http.StatusOK {
+		t.Fatalf("oversized body accepted (status=%d)", rr.Code)
+	}
+	if _, err := os.Stat(filepath.Join(cfgRoot, "jail.d", "okjail.local")); err == nil {
+		t.Fatal("oversized body was written to disk")
+	}
+}
+
+func TestCreateJailRejectsTraversalName(t *testing.T) {
+	cfgRoot := t.TempDir()
+	svc := fail2ban.NewService(cfgRoot, "/var/run/fail2ban", "/var/log")
+	hs := health.New(svc, time.Hour, false, false, 1)
+	s := New("secret", cfgRoot, svc, hs)
+
+	body := `{"name":"../../../../../../tmp/f2b-agent-pwn","content":"x"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/jails", strings.NewReader(body))
+	req.Header.Set("X-F2B-Token", "secret")
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code == http.StatusCreated || rr.Code == http.StatusOK {
+		t.Fatalf("traversal jail name accepted (status=%d)", rr.Code)
+	}
+	if _, err := os.Stat("/tmp/f2b-agent-pwn.local"); err == nil {
+		os.Remove("/tmp/f2b-agent-pwn.local")
+		t.Fatal("traversal escaped the config root")
+	}
+}
+
+func TestHealthRedactsErrorForAnonymous(t *testing.T) {
+	svc := fail2ban.NewService(t.TempDir(), "/var/run/fail2ban", "/var/log")
+	hs := health.New(svc, time.Hour, false, false, 1)
+	s := New("secret", t.TempDir(), svc, hs)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil) // no token
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	var state map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &state)
+	if _, present := state["lastError"]; present {
+		t.Fatal("anonymous /healthz leaked lastError")
+	}
 }
 
 func TestHealthEndpoint(t *testing.T) {
